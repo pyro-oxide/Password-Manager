@@ -1,0 +1,6 @@
+cryptography>=44.0.1
+pyperclip>=1.8.2
+zxcvbn>=4.4.28
+PyQt5>=5.15.6 
+pillow~=11.2.0
+QtAwesome~=1.4.0
