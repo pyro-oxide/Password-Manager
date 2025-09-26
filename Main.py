@@ -1,6 +1,8 @@
 import sys
 import logging
 import time
+import random
+import string
 from typing import Optional, Dict, Any, List
 
 # Use PyQt5 if available, otherwise fall back or notify
@@ -687,9 +689,9 @@ class SettingsDialog(QDialog):
         self.accept()
 
     def update_tfa_status(self):
-        is_enabled = self.db.get_setting("2fa_email_enabled") == "1"
+        is_enabled = bool(self.db.get_setting("totp_secret_encrypted"))
         if is_enabled:
-            self.tfa_status_label.setText("Status: <b style='color: green;'>Enabled (Email OTP)</b>")
+            self.tfa_status_label.setText("Status: <b style='color: green;'>Enabled (Authenticator App)</b>")
             self.tfa_enable_button.setEnabled(False)
             self.tfa_disable_button.setEnabled(True)
         else:
@@ -702,64 +704,63 @@ class SettingsDialog(QDialog):
         if not self.cipher:
             QMessageBox.critical(self, "Error", "Cannot enable 2FA without a valid encryption key.")
             return
-        email = self.db.get_user_email()
-        if not email:
-            email, ok = QInputDialog.getText(self, "Set Email Address", "Enter your email address for OTP delivery:")
-            if not ok or not email.strip():
-                QMessageBox.warning(self, "Email Required", "You must provide an email address to enable 2FA.")
-                return
-            if not self.db.set_user_email(email.strip()):
-                QMessageBox.critical(self, "Error", "Failed to save email address.")
-                return
-            email = email.strip()
-        otp_code = ''.join(random.choices(string.digits, k=6))
-        self.progress = QProgressDialog("Sending OTP email...", None, 0, 0, self)
-        self.progress.setWindowModality(Qt.WindowModal)
-        self.progress.setWindowTitle("Please Wait")
-        self.progress.setCancelButton(None)
-        self.progress.setAutoClose(False)
-        self.progress.setAutoReset(False)
-        self.progress.show()
-        self.setEnabled(False)  # Disable dialog while thread is running
-        self.email_thread = EmailSenderThread(email, otp_code, "Enable 2FA - OTP Verification", self)
-        def on_result(ok, err):
-            self.progress.close()
-            self.progress = None
-            self.email_thread = None  # Allow cleanup
-            self.setEnabled(True)  # Re-enable dialog
-            if not ok:
-                QMessageBox.critical(self, "Error", f"Failed to send OTP to {email}. {err}")
-                return
-            # Prompt user to enter the OTP
-            otp_dialog = QDialog(self)
-            otp_dialog.setWindowTitle("Verify Email OTP")
-            otp_layout = QVBoxLayout(otp_dialog)
-            otp_layout.addWidget(QLabel(f"An OTP has been sent to: {email}"))
-            otp_edit = QLineEdit()
-            otp_edit.setPlaceholderText("Enter the 6-digit OTP")
-            otp_layout.addWidget(otp_edit)
-            otp_error = QLabel("")
-            otp_error.setStyleSheet("color: red;")
-            otp_layout.addWidget(otp_error)
-            otp_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            otp_layout.addWidget(otp_box)
-            def check_otp():
-                if otp_edit.text().strip() == otp_code:
-                    otp_dialog.accept()
-                else:
-                    otp_error.setText("Incorrect OTP. Please try again.")
-            otp_box.accepted.connect(check_otp)
-            otp_box.rejected.connect(otp_dialog.reject)
-            if otp_dialog.exec_() != QDialog.Accepted:
-                QMessageBox.warning(self, "2FA Setup Cancelled", "2FA setup was cancelled or OTP was incorrect.")
-                return
-            if self.db.set_setting("2fa_email_enabled", "1"):
-                QMessageBox.information(self, "Success", "Email-based Two-Factor Authentication enabled successfully!")
-                self.update_tfa_status()
+        # Generate TOTP secret and provisioning URI
+        secret = generate_totp_secret()
+        account_name = self.db.get_user_email() or "user"
+        uri = get_totp_uri(secret, account_name, TOTP_ISSUER_NAME)
+
+        # Dialog with QR code and manual code
+        setup_dialog = QDialog(self)
+        setup_dialog.setWindowTitle("Set up Authenticator App")
+        layout = QVBoxLayout(setup_dialog)
+        layout.addWidget(QLabel("Scan the QR code in your authenticator app, or enter the secret manually."))
+
+        qr_path = generate_qr_code_image(uri, filename="totp_qr.png")
+        if qr_path:
+            qr_label = QLabel()
+            try:
+                qr_pixmap = QPixmap(qr_path)
+                qr_label.setPixmap(qr_pixmap.scaled(220, 220, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            except Exception:
+                qr_label.setText("QR not available")
+            layout.addWidget(qr_label)
+
+        secret_label = QLabel(f"Secret: <code>{secret}</code>")
+        secret_label.setTextFormat(Qt.RichText)
+        layout.addWidget(secret_label)
+
+        code_edit = QLineEdit()
+        code_edit.setPlaceholderText("Enter the 6-digit code from your app")
+        layout.addWidget(code_edit)
+        error_label = QLabel("")
+        error_label.setStyleSheet("color: red;")
+        layout.addWidget(error_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def verify_code():
+            code = code_edit.text().strip()
+            if verify_totp_code(secret, code):
+                setup_dialog.accept()
             else:
-                QMessageBox.critical(self, "Error", "Failed to save 2FA settings to the database.")
-        self.email_thread.result.connect(on_result)
-        self.email_thread.start()
+                error_label.setText("Invalid code. Please try again.")
+        buttons.accepted.connect(verify_code)
+        buttons.rejected.connect(setup_dialog.reject)
+
+        if setup_dialog.exec_() != QDialog.Accepted:
+            QMessageBox.warning(self, "2FA Setup Cancelled", "Setup was cancelled or the code was incorrect.")
+            return
+
+        # Encrypt and store secret
+        enc_secret = encrypt_data(secret.encode('utf-8'), self.cipher)
+        if not enc_secret:
+            QMessageBox.critical(self, "Error", "Failed to secure 2FA secret.")
+            return
+        if self.db.set_setting("totp_secret_encrypted", enc_secret):
+            QMessageBox.information(self, "Success", "Authenticator App 2FA enabled successfully!")
+            self.update_tfa_status()
+        else:
+            QMessageBox.critical(self, "Error", "Failed to save 2FA settings to the database.")
 
     def disable_2fa(self):
         reply = QMessageBox.warning(self, "Disable 2FA",
@@ -767,7 +768,7 @@ class SettingsDialog(QDialog):
                                     "You will no longer be prompted for a code at login.",
                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
-            if self.db.set_setting("2fa_email_enabled", "0"):
+            if self.db.set_setting("totp_secret_encrypted", ""):
                 QMessageBox.information(self, "Success", "Two-Factor Authentication has been disabled.")
                 self.update_tfa_status()
             else:
@@ -845,15 +846,42 @@ class SettingsDialog(QDialog):
             else:
                 password_map[password] = [site_user]
 
-            # Check Age (e.g., older than 1 year) - Requires datetime parsing
-            try:
-                from datetime import datetime, timedelta
-                updated_time = datetime.fromisoformat(
-                    entry['updated_at'].split('.')[0])  # Handle potential fractional seconds
-                if updated_time < datetime.now() - timedelta(days=365):
-                    old_passwords.append(f"- {site_user} (Last updated: {updated_time.strftime('%Y-%m-%d')})")
-            except (ValueError, TypeError) as e:
-                log.warning(f"Could not parse timestamp for health check: {entry['updated_at']} - {e}")
+            # Check Age (e.g., older than 1 year) - Robust datetime parsing
+            from datetime import datetime, timedelta
+            def _parse_to_datetime(value):
+                try:
+                    if value is None:
+                        return None
+                    # If it's a datetime-like object
+                    if hasattr(value, 'isoformat') and hasattr(value, 'strftime'):
+                        return value
+                    # If it's a string, try multiple formats
+                    if isinstance(value, str):
+                        s = value.strip()
+                        if not s:
+                            return None
+                        # Normalize common ISO forms
+                        s = s.replace('Z', '')
+                        if 'T' in s:
+                            s_base = s.split('.')[0]
+                            try:
+                                return datetime.fromisoformat(s_base)
+                            except Exception:
+                                pass
+                        # Try space-separated format
+                        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                            try:
+                                return datetime.strptime(s.split('.')[0], fmt)
+                            except Exception:
+                                continue
+                    # Fallback: not parseable
+                    return None
+                except Exception:
+                    return None
+
+            updated_time = _parse_to_datetime(entry.get('updated_at'))
+            if updated_time and updated_time < datetime.now() - timedelta(days=365):
+                old_passwords.append(f"- {site_user} (Last updated: {updated_time.strftime('%Y-%m-%d')})")
 
         # Filter reused passwords
         for password, users in password_map.items():
@@ -1083,8 +1111,9 @@ class PasswordManagerGUI(QMainWindow):
                 return False
             self.current_master_hash, self.current_salt = master_data
 
-        is_2fa_enabled = self.db.get_setting("2fa_email_enabled") == "1"
-        user_email = self.db.get_user_email() if is_2fa_enabled else None
+        # TOTP-based 2FA detection
+        enc_totp_secret = self.db.get_setting("totp_secret_encrypted")
+        is_2fa_enabled = bool(enc_totp_secret)
 
         for attempt in range(3):
             dialog = PasswordDialog(self, prompt_message, title="Unlock Vault")
@@ -1102,54 +1131,35 @@ class PasswordManagerGUI(QMainWindow):
                     key = generate_encryption_key_from_password(password, self.current_salt)
                     self.cipher = Fernet(key)
 
-                    if is_2fa_enabled and user_email:
-                        otp_code = ''.join(random.choices(string.digits, k=6))
-                        progress = QProgressDialog("Sending OTP email...", None, 0, 0, self)
-                        progress.setWindowModality(Qt.WindowModal)
-                        progress.setWindowTitle("Please Wait")
-                        progress.setCancelButton(None)
-                        progress.show()
-                        self.login_email_thread = EmailSenderThread(user_email, otp_code, "Login OTP", self)
-                        result_holder = {"success": None}
-                        def on_result(ok, err):
-                            progress.close()
-                            self.login_email_thread = None
-                            if not ok:
-                                QMessageBox.critical(self, "Error", f"Failed to send OTP to {user_email}. {err}")
+                    if is_2fa_enabled:
+                        # Verify TOTP code from authenticator app
+                        secret_bytes = decrypt_data(enc_totp_secret, self.cipher)
+                        if not secret_bytes:
+                            QMessageBox.critical(self, "2FA Error", "Failed to read TOTP secret. Cannot proceed.")
+                            self.cipher = None
+                            return False
+                        secret = secret_bytes.decode('utf-8')
+                        for otp_attempt in range(3):
+                            code, ok2 = QInputDialog.getText(self, "Two-Factor Authentication", "Enter the 6-digit code from your authenticator app:")
+                            if not ok2:
+                                log.warning("2FA cancelled by user.")
                                 self.cipher = None
-                                result_holder["success"] = False
-                                return
-                            for otp_attempt in range(3):
-                                otp, ok2 = QInputDialog.getText(self, "Two-Factor Authentication", f"Enter the OTP sent to {user_email}:")
-                                if not ok2:
-                                    log.warning("2FA cancelled by user.")
-                                    self.cipher = None
-                                    result_holder["success"] = False
-                                    return
-                                if otp.strip() == otp_code:
-                                    result_holder["success"] = True
-                                    break
-                                else:
-                                    QMessageBox.warning(self, "Login Failed", f"Incorrect OTP. {2 - otp_attempt} attempts remaining.")
-                                    if otp_attempt == 2:
-                                        log.warning("Too many failed OTP attempts.")
-                                        QMessageBox.critical(self, "Login Failed", "Too many failed OTP attempts.")
-                                        self.cipher = None
-                                        result_holder["success"] = False
-                                        return
-                            if result_holder["success"]:
+                                return False
+                            if verify_totp_code(secret, code.strip()):
                                 self.is_locked = False
                                 self.last_activity_time = time.time()
                                 log.info("Login successful. Vault unlocked internally.")
-                                result_holder["success"] = True
-                        self.login_email_thread.result.connect(on_result)
-                        self.login_email_thread.start()
-                        # Wait for the thread and OTP dialog to finish
-                        while result_holder["success"] is None:
-                            QApplication.processEvents()
-                        if not result_holder["success"]:
-                            return False
-                        return True
+                                return True
+                            else:
+                                remaining = 2 - otp_attempt
+                                if remaining >= 0:
+                                    QMessageBox.warning(self, "Login Failed", f"Incorrect code. {remaining} attempts remaining.")
+                                if otp_attempt == 2:
+                                    log.warning("Too many failed TOTP attempts.")
+                                    QMessageBox.critical(self, "Login Failed", "Too many failed 2FA attempts.")
+                                    self.cipher = None
+                                    return False
+                        return False
                     else:
                         self.is_locked = False
                         self.last_activity_time = time.time()
@@ -1802,16 +1812,29 @@ class PasswordManagerGUI(QMainWindow):
             self.notes_display.setText(notes); self.notes_display.setVisible(True)
         else:
             self.notes_display.clear(); self.notes_display.setVisible(False)
-        try:
-            self.created_value.setText(
-                QDateTime.fromString(created_at.split('.')[0], "yyyy-MM-ddTHH:mm:ss").toString("yyyy-MM-dd HH:mm:ss"))
-        except:
-            self.created_value.setText(created_at or '-')
-        try:
-            self.updated_value.setText(
-                QDateTime.fromString(updated_at.split('.')[0], "yyyy-MM-ddTHH:mm:ss").toString("yyyy-MM-dd HH:mm:ss"))
-        except:
-            self.updated_value.setText(updated_at or '-')
+        def _format_timestamp(value):
+            # Accept datetime, date, or string; return human-readable string or '-'
+            try:
+                if value is None:
+                    return '-'
+                # If it's a datetime-like object
+                if hasattr(value, 'isoformat'):
+                    iso_str = value.isoformat()
+                    base_str = iso_str.split('.')[0]
+                    qdt = QDateTime.fromString(base_str, "yyyy-MM-ddTHH:mm:ss")
+                    return qdt.toString("yyyy-MM-dd HH:mm:ss") if qdt.isValid() else str(value)
+                # If it's already a string
+                if isinstance(value, str):
+                    base_str = value.split('.')[0]
+                    qdt = QDateTime.fromString(base_str, "yyyy-MM-ddTHH:mm:ss")
+                    return qdt.toString("yyyy-MM-dd HH:mm:ss") if qdt.isValid() else (value or '-')
+                # Fallback
+                return str(value)
+            except Exception:
+                return '-' if not value else str(value)
+
+        self.created_value.setText(_format_timestamp(created_at))
+        self.updated_value.setText(_format_timestamp(updated_at))
 
     def clear_details(self):
         self.detail_site_name.setText("No item selected");

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import os
 
 # Application settings
 APP_NAME = "Secure Password Manager"
@@ -36,3 +37,13 @@ ICON_PATH.mkdir(exist_ok=True)
 
 # 2FA Settings
 TOTP_ISSUER_NAME = APP_NAME
+
+# Database engine selection (force MySQL only)
+DB_ENGINE = "mysql"
+
+# MySQL settings
+MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "K@nw@l1007")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "password_manager")

@@ -4,3 +4,4 @@ zxcvbn>=4.4.28
 PyQt5>=5.15.6 
 pillow~=11.2.0
 QtAwesome~=1.4.0
+mysql-connector-python>=9.0.0
