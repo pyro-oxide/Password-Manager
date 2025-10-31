@@ -8,6 +8,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from config import LOG_PATH, SALT_LENGTH, KEY_LENGTH, ITERATIONS, DATA_DIR
 import zxcvbn
 import json
+from datetime import datetime, date
 from typing import Dict, Any, Optional, Tuple, List
 import time
 import pyotp # Required for 2FA
@@ -236,10 +237,25 @@ def generate_password(length: int = 16, use_uppercase: bool = True, use_lowercas
     return "".join(password_chars)
 
 # Export / Import Utilities
+def _json_default_serializer(obj):
+    """Serialize non-JSON types for export.
+    - datetime/date -> ISO 8601 string
+    - objects with isoformat() -> use that
+    - fallback -> str(obj)
+    """
+    try:
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        # Some Qt/PyQt date types or other objects expose isoformat
+        if hasattr(obj, 'isoformat') and callable(getattr(obj, 'isoformat')):
+            return obj.isoformat()
+    except Exception:
+        pass
+    return str(obj)
 def export_vault(data: Dict[str, Any], filepath: str, cipher_suite: Fernet) -> bool:
     """Export vault data to an encrypted JSON file."""
     try:
-        json_data = json.dumps(data, indent=2).encode('utf-8')
+        json_data = json.dumps(data, indent=2, default=_json_default_serializer).encode('utf-8')
         encrypted_content = encrypt_data(json_data, cipher_suite)
         if encrypted_content is None:
             return False
